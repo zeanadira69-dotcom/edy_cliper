@@ -3,6 +3,11 @@ module.exports = {
     reactCompiler: true,
   },
   transpilePackages: ["gifsicle-wasm-browser"],
+  async rewrites() {
+    return {
+      beforeFiles: [{ source: "/", destination: "/clipper/index.html" }],
+    };
+  },
   async headers() {
     return [
       {
