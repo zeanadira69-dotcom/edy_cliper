@@ -22,3 +22,5 @@ const dlVid: NextApiHandler = async (req, res) => {
 };
 
 export default dlVid;
+
+export const config = { maxDuration: 60 };
