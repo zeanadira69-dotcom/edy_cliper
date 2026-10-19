@@ -1,8 +1,23 @@
 // POST /api/highlights
+// Header: x-groq-key (atau env GROQ_API_KEY)
 // Body JSON: { text: "[detik] kalimat\n...", from: detikAwal, to: detikAkhir }
-// Balasan: { clips: [{start, end, title, score}], keywords: ["kata", ...] }
+// Balasan: { clips: [{start, end, title, score}], keywords: ["kata", ...], model }
+//
+// Model dipilih otomatis: route menanyakan Groq model apa yang boleh dipakai key ini,
+// lalu mencoba kandidat satu per satu sampai ada yang berhasil.
 
-const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
+const BASE = 'https://api.groq.com/openai/v1';
+
+const PREFER = [
+  'openai/gpt-oss-20b',
+  'llama-3.1-8b-instant',
+  'llama-3.3-70b-versatile',
+  'openai/gpt-oss-120b',
+  'qwen/qwen3.8-27b',
+  'meta-llama/llama-4-scout-17b-16e-instruct',
+  'minimaxai/minimax-m2.7',
+];
+const NOT_CHAT = /whisper|guard|safeguard|tts|orpheus|playai|embed|moderation/i;
 
 const SYSTEM = [
   'Kamu editor klip viral untuk TikTok/Reels/Shorts.',
@@ -13,6 +28,61 @@ const SYSTEM = [
   'Pilih juga sampai 12 kata kunci (satu kata, huruf kecil) dari segmen terpilih yang pantas ditonjolkan di layar.',
   'Balas HANYA JSON: {"clips":[{"start":0,"end":0,"title":"","score":0}],"keywords":[""]}',
 ].join(' ');
+
+const modelCache = new Map(); // key -> { at, ids }
+
+async function listModels(key) {
+  const hit = modelCache.get(key);
+  if (hit && Date.now() - hit.at < 10 * 60 * 1000) return hit.ids;
+  try {
+    const r = await fetch(BASE + '/models', { headers: { Authorization: 'Bearer ' + key } });
+    if (!r.ok) return null;
+    const j = await r.json();
+    const ids = (j.data || []).map((m) => m.id).filter(Boolean);
+    modelCache.set(key, { at: Date.now(), ids });
+    return ids;
+  } catch (e) {
+    return null;
+  }
+}
+
+function pickCandidates(ids) {
+  if (!ids) return PREFER.slice();
+  const chat = ids.filter((id) => !NOT_CHAT.test(id));
+  const first = PREFER.filter((id) => chat.includes(id));
+  const rest = chat.filter((id) => !first.includes(id));
+  return first.concat(rest).slice(0, 5);
+}
+
+function extractJson(text) {
+  const t = String(text || '').replace(/<think>[\s\S]*?<\/think>/g, '');
+  try { return JSON.parse(t); } catch (e) {}
+  const m = t.match(/\{[\s\S]*\}/);
+  if (m) { try { return JSON.parse(m[0]); } catch (e) {} }
+  return null;
+}
+
+async function ask(key, model, text, withFormat) {
+  const body = {
+    model,
+    temperature: 0.3,
+    max_tokens: 2500,
+    messages: [
+      { role: 'system', content: SYSTEM },
+      { role: 'user', content: text },
+    ],
+  };
+  if (withFormat) body.response_format = { type: 'json_object' };
+  if (/gpt-oss/i.test(model)) body.reasoning_effort = 'low';
+  const r = await fetch(BASE + '/chat/completions', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (r.ok) return { ok: true, data: await r.json() };
+  const txt = await r.text();
+  return { ok: false, status: r.status, txt, retry: Number(r.headers.get('retry-after')) || 0 };
+}
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -36,34 +106,40 @@ export default async function handler(req, res) {
       return;
     }
 
-    const r = await fetch(GROQ_URL, {
-      method: 'POST',
-      headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: process.env.GROQ_LLM_MODEL || 'llama-3.1-8b-instant',
-        temperature: 0.3,
-        max_tokens: 700,
-        response_format: { type: 'json_object' },
-        messages: [
-          { role: 'system', content: SYSTEM },
-          { role: 'user', content: text },
-        ],
-      }),
-    });
+    const ids = await listModels(key);
+    const candidates = pickCandidates(ids);
+    const tried = [];
+    let maxRetry = 0, saw429 = false, parsed = null, used = '';
 
-    if (!r.ok) {
-      const txt = await r.text();
-      const retry = Number(r.headers.get('retry-after')) || 0;
-      res.status(r.status).json({ error: 'Groq: ' + txt.slice(0, 300), retryAfter: retry });
-      return;
+    for (const model of candidates) {
+      let r = await ask(key, model, text, true);
+      if (!r.ok && r.status === 400 && /response_format|json/i.test(r.txt)) r = await ask(key, model, text, false);
+      if (!r.ok) {
+        tried.push(model + ' (' + r.status + ')');
+        if (r.status === 401) {
+          res.status(401).json({ error: 'API Key Groq ditolak (tidak valid). Cek key lalu Simpan lagi.' });
+          return;
+        }
+        if (r.status === 429) { saw429 = true; maxRetry = Math.max(maxRetry, r.retry); }
+        continue;
+      }
+      let p = null;
+      try { p = extractJson(r.data.choices[0].message.content); } catch (e) { p = null; }
+      if (!p) { tried.push(model + ' (balasan bukan JSON)'); continue; }
+      parsed = p; used = model;
+      break;
     }
 
-    const data = await r.json();
-    let parsed = {};
-    try {
-      parsed = JSON.parse(data.choices[0].message.content);
-    } catch (e) {
-      parsed = {};
+    if (!parsed) {
+      if (saw429) {
+        res.status(429).json({ error: 'Batas Groq tercapai untuk semua model yang tersedia.', retryAfter: maxRetry });
+        return;
+      }
+      res.status(502).json({
+        error: 'Tidak ada model Groq yang bisa dipakai key ini. Dicoba: ' + (tried.join(', ') || 'tidak ada model') +
+          (ids ? '. Model tersedia di key-mu: ' + ids.filter((i) => !NOT_CHAT.test(i)).join(', ') : ''),
+      });
+      return;
     }
 
     const clips = (Array.isArray(parsed.clips) ? parsed.clips : [])
@@ -89,7 +165,7 @@ export default async function handler(req, res) {
       .filter((k) => k.length > 2)
       .slice(0, 20);
 
-    res.status(200).json({ clips, keywords });
+    res.status(200).json({ clips, keywords, model: used });
   } catch (err) {
     res.status(500).json({ error: String((err && err.message) || err) });
   }
