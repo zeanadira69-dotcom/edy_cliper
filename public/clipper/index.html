@@ -57,14 +57,17 @@ a.dl{display:inline-block;margin-top:10px;padding:10px 14px;background:var(--ok)
 <h1>Pono <span>Clipper</span></h1>
 
 <div class="card">
-  <h2>API Key Groq</h2>
+  <h2>API Key</h2>
+  <label>Groq (wajib, untuk transkrip)</label>
   <input id="key" type="password" class="k" placeholder="gsk_..." autocomplete="off" autocapitalize="off" spellcheck="false">
+  <label style="margin-top:10px">Gemini (opsional, untuk mencari momen terbaik dari link YouTube)</label>
+  <input id="gkey" type="password" class="k" placeholder="AIza..." autocomplete="off" autocapitalize="off" spellcheck="false">
   <div class="row" style="margin-top:8px">
     <button class="sm pri" id="btnKeySave">Simpan</button>
     <button class="sm" id="btnKeyShow">Lihat</button>
     <button class="sm" id="btnKeyDel">Hapus</button>
   </div>
-  <div id="keyStatus" class="hint">Buat key gratis di console.groq.com. Key tersimpan hanya di browser HP ini dan dikirim lewat server Vercel kamu ke Groq, tidak disimpan di server.</div>
+  <div id="keyStatus" class="hint">Key tersimpan hanya di browser HP ini. Key Groq dikirim lewat server Vercel-mu, key Gemini dikirim langsung dari browser ke Google. Buat key gratis di console.groq.com dan aistudio.google.com.</div>
 </div>
 
 <div class="card">
@@ -73,10 +76,14 @@ a.dl{display:inline-block;margin-top:10px;padding:10px 14px;background:var(--ok)
   <div id="boxUp">
     <input id="file" type="file" accept="video/*">
     <div class="hint">Video diproses di HP. Hanya potongan audio yang dikirim ke Groq lewat server Vercel kamu.</div>
+    <div id="gmBox" class="chk" style="margin-top:10px" hidden>
+      <label><input type="checkbox" id="useGm" checked> <span id="gmLbl">Pakai momen dari Gemini</span></label>
+    </div>
   </div>
   <div id="boxYt" hidden>
     <input id="yt" type="text" class="k" placeholder="https://youtube.com/watch?v=..." autocomplete="off" autocapitalize="off" spellcheck="false">
-    <div class="hint">Server mengunduh video 360p dari YouTube. YouTube sering memblokir server, kalau gagal unduh videonya lalu pakai Upload.</div>
+    <button id="btnGem" class="sm" style="margin-top:8px">Cari momen dengan Gemini</button>
+    <div class="hint">Gemini menonton videonya dan menandai momen terbaik. Lalu Generate mencoba mengunduh video 360p lewat server. YouTube sering memblokirnya: kalau gagal, unduh videonya sendiri, buka tab Upload video, dan momen dari Gemini dipakai otomatis. Video harus publik.</div>
   </div>
   <div style="margin-top:10px"><label>Bahasa video</label>
     <select id="lang">
@@ -154,7 +161,7 @@ const W = 540, H = 960, CH = 90, ACC = '#ffcf3a';
 const cv = $('#cv'), cx = cv.getContext('2d');
 const vid = $('#vid');
 
-const S = { start:0, end:30, pan:.5, mode:'crop', words:[], groups:[], auto:false, tr:null, keys:new Set(), warm:0, file:null, from:null, ytUrl:null, out:null };
+const S = { start:0, end:30, pan:.5, mode:'crop', words:[], groups:[], auto:false, tr:null, keys:new Set(), warm:0, file:null, from:null, ytUrl:null, out:null, ab:null, tw:{}, chosen:false, gm:null };
 let srcMode = 'up', busy = false, lastPct = -1;
 let rec = null, actx = null, gain = null, adest = null, srcNode = null;
 
@@ -168,6 +175,9 @@ const wordKey = w => w.replace(/[^\p{L}\p{N}]/gu, '');
 const KEY_NAME = 'pono_groq_key';
 function getKey(){ try { return (localStorage.getItem(KEY_NAME) || '').trim(); } catch(e){ return (window.__k || '').trim(); } }
 function putKey(v){ window.__k = v; try { if (v) localStorage.setItem(KEY_NAME, v); else localStorage.removeItem(KEY_NAME); } catch(e){} }
+const GKEY_NAME = 'pono_gemini_key';
+function getGKey(){ try { return (localStorage.getItem(GKEY_NAME) || '').trim(); } catch(e){ return (window.__gk || '').trim(); } }
+function putGKey(v){ window.__gk = v; try { if (v) localStorage.setItem(GKEY_NAME, v); else localStorage.removeItem(GKEY_NAME); } catch(e){} }
 function keyMsg(m, ok){ const el = $('#keyStatus'); el.textContent = m; el.style.color = ok ? 'var(--ok)' : 'var(--mut)'; }
 
 function setStatus(msg, cls){ const el = $('#status'); el.textContent = msg; el.className = cls || ''; }
@@ -455,26 +465,65 @@ async function api(path, opts, label){
   throw new Error('Gagal setelah beberapa percobaan (limit Groq).');
 }
 
-async function analyze(){
-  setBar(0);
-  $('#clips').innerHTML = '';
-  setStatus('Membaca audio dari video…');
-  const ab = await decodeAudio(S.file);
-  const nChunks = Math.ceil(ab.duration / CH);
-  const words = [];
+async function getAB(){
+  if (!S.ab) { setStatus('Membaca audio dari video…'); S.ab = await decodeAudio(S.file); }
+  return S.ab;
+}
+async function ensureWords(a, b){
+  const ab = await getAB();
+  const n = Math.ceil(ab.duration / CH);
+  const i0 = clamp(Math.floor((a - 5) / CH), 0, n - 1), i1 = clamp(Math.floor((b + 5) / CH), 0, n - 1);
   const lang = $('#lang').value;
-  for (let i = 0; i < nChunks; i++) {
-    const label = 'Transkrip ' + (i+1) + '/' + nChunks;
-    setStatus(label + '…'); setBar(.05 + .6 * i / nChunks);
+  for (let i = i0; i <= i1; i++) {
+    if (S.tw[i]) continue;
+    const label = 'Transkrip bagian ' + (i+1) + '/' + n;
+    setStatus(label + '…'); setBar(.1 + .5 * (i - i0) / Math.max(1, i1 - i0 + 1));
     const { blob, rms } = chunkWav(ab, i);
-    if (rms < .002) continue;
+    if (rms < .002) { S.tw[i] = []; continue; }
     const d = await api('/api/transcribe?offset=' + (i * CH) + '&lang=' + lang, {
       method:'POST', headers:{ 'Content-Type':'application/octet-stream' }, body:blob
     }, label);
-    words.push(...d.words);
+    S.tw[i] = d.words;
   }
-  if (!words.length) throw new Error('Tidak ada ucapan terdeteksi.');
-  S.tr = { words };
+  S.tr = { words: Object.keys(S.tw).map(Number).sort((x, y) => x - y).flatMap(k => S.tw[k]) };
+  if (!S.tr.words.length) throw new Error('Tidak ada ucapan terdeteksi di bagian video ini.');
+}
+// rapikan batas klip dari Gemini ke jeda kalimat terdekat (pakai kata dari Whisper)
+function snap(c){
+  const w = S.tr ? S.tr.words : [];
+  if (w.length < 5) return c;
+  let s = c.start, e = c.end;
+  const i = w.findIndex(x => x.e > s - .05);
+  if (i >= 0) {
+    s = w[i].s - .1;
+    for (let k = i; k >= 0 && w[i].s - w[k].s <= 3; k--) {
+      if (k === 0 || w[k].s - w[k-1].e > .45) { s = w[k].s - .1; break; }
+    }
+  }
+  let l = -1;
+  for (let k = 0; k < w.length; k++) if (w[k].s < e) l = k;
+  if (l >= 0) {
+    e = w[l].e + .15;
+    for (let k = l; k < w.length && w[k].e - w[l].e <= 4; k++) {
+      if (k === w.length - 1 || w[k+1].s - w[k].e > .45) { e = w[k].e + .15; break; }
+    }
+  }
+  s = Math.max(0, s);
+  if (e - s > 60) e = s + 60;
+  return Object.assign({}, c, { start:s, end:e });
+}
+async function analyze(){
+  setBar(0); $('#clips').innerHTML = '';
+  if (S.gm && $('#useGm').checked) {
+    const top = S.gm.clips[0];
+    S.keys = new Set(S.gm.keywords);
+    await ensureWords(top.start, top.end);
+    applyClip(snap(top)); renderClips(S.gm.clips); S.chosen = true; setBar(1);
+    return;
+  }
+  const ab = await getAB();
+  await ensureWords(0, ab.duration);
+  const words = S.tr.words;
 
   const lines = [];
   for (let i = 0; i < words.length; i += 10) {
@@ -503,9 +552,153 @@ async function analyze(){
   clips.sort((a,b) => b.score - a.score);
   clips = clips.slice(0, 6);
   setBar(1);
-  if (!clips.length) { S.tr = null; throw new Error('AI tidak menemukan momen yang cocok di video ini.'); }
+  if (!clips.length) throw new Error('AI tidak menemukan momen yang cocok di video ini.');
   renderClips(clips);
   applyClip(clips[0]);
+  S.chosen = true;
+}
+
+/* ---------- Gemini: cari momen dari link YouTube ---------- */
+const GBASE = 'https://generativelanguage.googleapis.com/v1beta';
+const GPREFER = ['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3-flash-preview', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'];
+const GSKIP = /image|tts|embed|live|audio|aqa|robotics|computer|veo|imagen|vision|learnlm|gemma/i;
+const GPROMPT = 'Kamu editor klip viral TikTok/Reels/Shorts. Tonton video ini lalu pilih 4 momen terbaik yang bisa berdiri sendiri sebagai klip pendek. ' +
+  'Aturan: durasi 20 sampai 50 detik, mulai dengan hook kuat (pertanyaan, klaim berani, cerita, atau punchline), selesai di akhir kalimat, tidak butuh konteks sebelumnya. ' +
+  'Waktu start dan end dalam format MM:SS (atau H:MM:SS) dihitung dari awal video, sepresisi mungkin. ' +
+  'Beri title pendek bahasa Indonesia, score 1-10 potensi viral, dan reason satu kalimat. ' +
+  'Pilih juga sampai 12 kata kunci (satu kata, huruf kecil) yang pantas ditonjolkan di layar. ' +
+  'Balas HANYA JSON: {"clips":[{"start":"MM:SS","end":"MM:SS","title":"","score":0,"reason":""}],"keywords":[""]}';
+const NETERR = 'Tidak bisa menghubungi Gemini dari browser. Cek koneksi lalu coba lagi.';
+
+function ytUrlOk(){
+  const url = $('#yt').value.trim();
+  if (!/^https?:\/\/((www|m|music)\.)?(youtube\.com|youtu\.be)\//i.test(url)) throw new Error('Link YouTube tidak valid. Contoh: https://youtu.be/xxxx');
+  return url;
+}
+function manualMsg(prefix){
+  const cur = $('#yt').value.trim();
+  return prefix + (S.gm && S.gm.url === cur
+    ? ' Momen terbaik dari Gemini sudah tersimpan: unduh videonya manual, buka tab Upload video, pilih file itu, lalu tekan Generate.'
+    : ' Unduh videonya dulu, lalu pakai tab Upload.');
+}
+function parseTs(v){
+  if (typeof v === 'number') return v;
+  const s = String(v || '').trim();
+  if (!s) return NaN;
+  if (/^\d+(\.\d+)?$/.test(s)) return parseFloat(s);
+  const p = s.split(':').map(Number);
+  if (p.some(x => !isFinite(x))) return NaN;
+  return p.reduce((a, x) => a * 60 + x, 0);
+}
+function digJson(o){
+  if (typeof o === 'string') {
+    const m = o.replace(/```json|```/g, '').match(/\{[\s\S]*\}/);
+    if (m) { try { const j = JSON.parse(m[0]); if (j && Array.isArray(j.clips)) return j; } catch(e){} }
+    return null;
+  }
+  if (o && typeof o === 'object') for (const k of Object.keys(o)) { const r = digJson(o[k]); if (r) return r; }
+  return null;
+}
+async function gfetch(url, key, body){
+  const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 280000);
+  try {
+    return await fetch(url, {
+      method: body ? 'POST' : 'GET',
+      headers: Object.assign({ 'x-goog-api-key':key }, body ? { 'Content-Type':'application/json' } : {}),
+      body: body ? JSON.stringify(body) : undefined, signal: ctl.signal
+    });
+  } finally { clearTimeout(t); }
+}
+async function findMoments(url){
+  const key = getGKey();
+  if (!key) throw new Error('Isi API Key Gemini dulu di kolom paling atas, lalu tekan Simpan.');
+  setBar(.05); setStatus('Gemini: memeriksa model yang tersedia…');
+  let models = [];
+  try {
+    const r = await gfetch(GBASE + '/models?pageSize=200', key);
+    if (r.ok) {
+      const j = await r.json();
+      models = (j.models || []).filter(m => /^models\/gemini/.test(m.name) && (m.supportedGenerationMethods || []).includes('generateContent') && !GSKIP.test(m.name)).map(m => m.name.replace('models/', ''));
+    } else if (r.status === 400 || r.status === 401 || r.status === 403) {
+      const t = await r.text();
+      if (/API.?KEY|api key|permission|PERMISSION/.test(t)) throw new Error('API Key Gemini ditolak. Cek key lalu Simpan lagi.');
+    }
+  } catch(e) {
+    if (e instanceof TypeError || e.name === 'AbortError') throw new Error(NETERR);
+    throw e;
+  }
+  const first = GPREFER.filter(m => models.includes(m));
+  const rest = models.filter(m => !first.includes(m) && /flash/i.test(m)).sort().reverse();
+  let cands = first.concat(rest).slice(0, 4);
+  if (!cands.length) cands = GPREFER.slice(0, 3);
+
+  const tried = []; let parsed = null, used = '', saw429 = false;
+  const mk = extra => ({
+    contents:[{ parts:[{ file_data:{ file_uri:url } }, { text:GPROMPT }] }],
+    generationConfig:Object.assign({ temperature:.3, responseMimeType:'application/json' }, extra)
+  });
+  for (const m of cands) {
+    setStatus('Gemini menonton video… (' + m + ')\nBisa 1–3 menit, jangan tutup halaman.'); setBar(.2);
+    let r;
+    try {
+      const ep = GBASE + '/models/' + m + ':generateContent';
+      r = await gfetch(ep, key, mk({ mediaResolution:'MEDIA_RESOLUTION_LOW' }));
+      if (r.status === 400) {
+        const t = await r.clone().text();
+        if (/media.?resolution|Unknown name/i.test(t)) r = await gfetch(ep, key, mk({}));
+      }
+    } catch(e) {
+      if (e.name === 'AbortError') throw new Error('Gemini terlalu lama merespons (lebih dari 4 menit). Coba video yang lebih pendek.');
+      throw new Error(NETERR);
+    }
+    if (!r.ok) {
+      const t = await r.text();
+      if (r.status === 429) saw429 = true;
+      tried.push(m + ' (' + r.status + '): ' + t.replace(/\s+/g, ' ').slice(0, 140));
+      continue;
+    }
+    const p = digJson(await r.json());
+    if (p) { parsed = p; used = m; break; }
+    tried.push(m + ' (balasan bukan JSON)');
+  }
+  if (!parsed && cands.length) {
+    try {
+      setStatus('Gemini: mencoba cara kedua…');
+      const r = await gfetch(GBASE + '/interactions', key, { model:cands[0], input:[{ type:'text', text:GPROMPT }, { type:'video', uri:url }] });
+      if (r.ok) { const p = digJson(await r.json()); if (p) { parsed = p; used = cands[0]; } }
+    } catch(e) {}
+  }
+  if (!parsed) {
+    throw new Error((saw429 ? 'Batas Gemini gratis tercapai atau video terlalu panjang untuk batas token per menit. Tunggu 1 menit atau pakai video yang lebih pendek.\n' : 'Gemini gagal membaca video ini (pastikan videonya publik).\n') + 'Detail: ' + (tried.join(' | ') || 'tidak ada model'));
+  }
+  const clips = (Array.isArray(parsed.clips) ? parsed.clips : [])
+    .map(c => ({ start:parseTs(c.start), end:parseTs(c.end), title:String(c.title || 'Momen').slice(0, 80), score:clamp(Number(c.score) || 5, 1, 10), reason:String(c.reason || '').slice(0, 160) }))
+    .filter(c => isFinite(c.start) && isFinite(c.end) && c.end > c.start)
+    .map(c => { if (c.end - c.start > 60) c.end = c.start + 60; return c; })
+    .filter(c => c.end - c.start >= 8)
+    .sort((a, b) => b.score - a.score).slice(0, 6);
+  const keywords = (Array.isArray(parsed.keywords) ? parsed.keywords : [])
+    .map(k => String(k).toLowerCase().replace(/[^\p{L}\p{N}]/gu, '')).filter(k => k.length > 2).slice(0, 20);
+  if (!clips.length) throw new Error('Gemini tidak menemukan momen yang cocok di video ini.');
+  S.gm = { url, clips, keywords, model:used };
+  renderClips(clips); updateGmBox(); setBar(1);
+  setStatus('Gemini selesai (' + used + '): ' + clips.length + ' momen ditemukan. Tekan Generate untuk mencoba unduh otomatis, atau unduh videonya manual lalu upload.', 'ok');
+}
+function updateGmBox(){
+  $('#gmBox').hidden = !S.gm;
+  if (S.gm) $('#gmLbl').textContent = 'Pakai momen dari Gemini (' + S.gm.clips.length + ' momen)';
+}
+async function pick(c){
+  if (!S.file) { setStatus('Upload videonya dulu (tab Upload video), baru momen ini bisa dipakai.', 'err'); return; }
+  if (busy) return;
+  busy = true;
+  try {
+    await ensureWords(c.start, c.end);
+    applyClip(S.gm && S.gm.clips.includes(c) ? snap(c) : c);
+    S.chosen = true; resetResult();
+    setStatus('Momen dipilih: ' + c.title + '. Tekan Generate untuk merekam.', 'ok');
+  } catch(e) { setStatus('Gagal: ' + (e.message || e), 'err'); }
+  finally { busy = false; }
 }
 function renderClips(clips){
   const box = $('#clips'); box.innerHTML = '';
@@ -515,8 +708,9 @@ function renderClips(clips){
     const b = document.createElement('b'); b.textContent = c.title;
     const sm = document.createElement('small'); sm.innerHTML = fmt(c.start) + '–' + fmt(c.end) + ' · ' + Math.round(c.end - c.start) + ' dtk · skor <span class="score">' + c.score + '</span>';
     l.appendChild(b); l.appendChild(sm);
+    if (c.reason) { const rs = document.createElement('small'); rs.style.display = 'block'; rs.textContent = c.reason; l.appendChild(rs); }
     const bt = document.createElement('button'); bt.className = 'sm'; bt.textContent = 'Pakai';
-    bt.onclick = () => applyClip(c);
+    bt.onclick = () => pick(c);
     d.appendChild(l); d.appendChild(bt); box.appendChild(d);
   });
 }
@@ -537,8 +731,9 @@ function loadFile(f, from){
   if (vid.src) { try { URL.revokeObjectURL(vid.src); } catch(e){} }
   vid.src = URL.createObjectURL(f);
   S.file = f; S.from = from;
-  S.tr = null; S.auto = false; S.keys = new Set();
-  $('#clips').innerHTML = ''; setBar(0); resetResult();
+  S.tr = null; S.auto = false; S.keys = new Set(); S.ab = null; S.tw = {}; S.chosen = false;
+  if (S.gm) renderClips(S.gm.clips); else $('#clips').innerHTML = '';
+  setBar(0); resetResult();
 }
 $('#file').addEventListener('change', e => {
   const f = e.target.files[0]; if (!f) return;
@@ -554,12 +749,11 @@ $('#tabYt').onclick = () => setTab('yt');
 $('#yt').addEventListener('input', () => { if (S.from === 'yt' && $('#yt').value.trim() !== S.ytUrl) resetResult(); });
 
 async function fetchYoutube(){
-  const url = $('#yt').value.trim();
-  if (!/^https?:\/\/((www|m|music)\.)?(youtube\.com|youtu\.be)\//i.test(url)) throw new Error('Link YouTube tidak valid. Contoh: https://youtu.be/xxxx');
+  const url = ytUrlOk();
   if (S.from === 'yt' && S.ytUrl === url && S.file) return;
   setBar(0); setStatus('Mengunduh video dari YouTube…');
   const r = await fetch('/api/dlVid?url=' + encodeURIComponent(url) + '&quality=18');
-  if (!r.ok) throw new Error('YouTube menolak unduhan dari server (sering terjadi). Unduh videonya dulu, lalu pakai tab Upload.');
+  if (!r.ok) throw new Error(manualMsg('YouTube menolak unduhan dari server (sering terjadi).'));
   let blob;
   if (r.body && r.body.getReader) {
     const rd = r.body.getReader(), parts = []; let got = 0;
@@ -571,7 +765,7 @@ async function fetchYoutube(){
     }
     blob = new Blob(parts, { type:'video/mp4' });
   } else { blob = await r.blob(); }
-  if (blob.size < 20000) throw new Error('Unduhan YouTube gagal atau kosong. Unduh videonya dulu, lalu pakai tab Upload.');
+  if (blob.size < 20000) throw new Error(manualMsg('Unduhan YouTube gagal atau kosong.'));
   loadFile(new File([blob], 'youtube.mp4', { type:'video/mp4' }), 'yt');
   S.ytUrl = url;
 }
@@ -586,11 +780,14 @@ async function generate(redo){
   if (busy) return;
   busy = true; $('#btnRedo').hidden = true; setMain('Memproses…', true);
   try {
-    if (!(redo && S.tr)) {
+    if (!(redo && S.chosen)) {
       if (!getKey()) throw new Error('Isi API Key Groq dulu di kolom paling atas, lalu tekan Simpan.');
-      if (srcMode === 'yt') await fetchYoutube();
-      else if (!S.file || S.from !== 'up') throw new Error('Pilih video dulu (tab Upload video).');
-      if (!S.tr) await analyze();
+      if (srcMode === 'yt') {
+        const url = ytUrlOk();
+        if (getGKey() && !(S.gm && S.gm.url === url)) await findMoments(url);
+        await fetchYoutube();
+      } else if (!S.file || S.from !== 'up') throw new Error('Pilih video dulu (tab Upload video).');
+      if (!S.chosen) await analyze();
     }
     $('#outBox').innerHTML = '';
     lastPct = -1;
@@ -603,7 +800,7 @@ async function generate(redo){
   } catch(e) {
     setStatus('Gagal: ' + (e.message || e), 'err');
     setMain('Generate'); delete $('#btnMain').dataset.done;
-    $('#btnRedo').hidden = !S.tr;
+    $('#btnRedo').hidden = !S.chosen;
   } finally { busy = false; }
 }
 $('#btnMain').onclick = () => { if (S.out && $('#btnMain').dataset.done) download(); else generate(false); };
@@ -633,17 +830,29 @@ $('#btnSample').onclick = () => {
 };
 $('#btnPlay').onclick = play;
 $('#btnKeySave').onclick = () => {
-  const v = $('#key').value.trim();
-  if (!v) { keyMsg('Kolom masih kosong.'); return; }
-  putKey(v);
-  keyMsg(v.startsWith('gsk_') ? 'Key tersimpan di HP ini.' : 'Tersimpan, tapi key Groq biasanya diawali gsk_. Pastikan sudah benar.', v.startsWith('gsk_'));
+  const g = $('#key').value.trim(), m = $('#gkey').value.trim();
+  if (!g && !m) { keyMsg('Kedua kolom masih kosong.'); return; }
+  const msg = [];
+  if (g) { putKey(g); msg.push(g.startsWith('gsk_') ? 'Groq tersimpan' : 'Groq tersimpan (biasanya diawali gsk_, cek lagi)'); }
+  if (m) { putGKey(m); msg.push(m.startsWith('AIza') ? 'Gemini tersimpan' : 'Gemini tersimpan (biasanya diawali AIza, cek lagi)'); }
+  keyMsg(msg.join(' · ') + '.', true);
 };
 $('#btnKeyShow').onclick = () => {
-  const el = $('#key'); const show = el.type === 'password';
-  el.type = show ? 'text' : 'password'; $('#btnKeyShow').textContent = show ? 'Sembunyi' : 'Lihat';
+  const show = $('#key').type === 'password';
+  $('#key').type = show ? 'text' : 'password'; $('#gkey').type = show ? 'text' : 'password';
+  $('#btnKeyShow').textContent = show ? 'Sembunyi' : 'Lihat';
 };
-$('#btnKeyDel').onclick = () => { putKey(''); $('#key').value = ''; keyMsg('Key dihapus dari HP ini.'); };
-if (getKey()) { $('#key').value = getKey(); keyMsg('Key tersimpan di HP ini.', true); }
+$('#btnKeyDel').onclick = () => { putKey(''); putGKey(''); $('#key').value = ''; $('#gkey').value = ''; keyMsg('Semua key dihapus dari HP ini.'); };
+if (getKey()) $('#key').value = getKey();
+if (getGKey()) $('#gkey').value = getGKey();
+if (getKey() || getGKey()) keyMsg('Key tersimpan di HP ini.', true);
+$('#btnGem').onclick = async () => {
+  if (busy) return;
+  busy = true; $('#btnGem').disabled = true;
+  try { await findMoments(ytUrlOk()); }
+  catch(e) { setStatus('Gagal: ' + (e.message || e), 'err'); setBar(0); }
+  finally { busy = false; $('#btnGem').disabled = false; }
+};
 
 requestAnimationFrame(loop);
 })();
