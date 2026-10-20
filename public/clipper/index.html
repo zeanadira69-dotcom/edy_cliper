@@ -37,6 +37,10 @@ input[type=range]{width:100%;accent-color:var(--ac)}
 .clip small{color:var(--mut)}
 .score{color:var(--ac);font-weight:700}
 input[type=password],input[type=text].k{width:100%;background:#0f1115;color:var(--tx);border:1px solid var(--line);border-radius:10px;padding:9px 10px;font:inherit}
+@font-face{font-family:PonoBlack;src:url(/clipper/fonts/Inter-Black.woff) format('woff');font-weight:900;font-style:normal;font-display:block}
+@font-face{font-family:PonoBlackIt;src:url(/clipper/fonts/Inter-BlackItalic.woff) format('woff');font-weight:900;font-style:normal;font-display:block}
+@font-face{font-family:PonoBold;src:url(/clipper/fonts/Poppins-Bold.woff) format('woff');font-weight:700;font-style:normal;font-display:block}
+@font-face{font-family:PonoMed;src:url(/clipper/fonts/Poppins-Medium.woff) format('woff');font-weight:500;font-style:normal;font-display:block}
 [hidden]{display:none!important}
 .seg{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:10px}
 .seg button{padding:10px;background:#12141a}
@@ -131,6 +135,13 @@ a.dl{display:inline-block;margin-top:10px;padding:10px 14px;background:var(--ok)
 
 <div class="card">
   <h2>4 · Teks &amp; efek</h2>
+  <label>Gaya subtitel</label>
+  <select id="capStyle">
+    <option value="karaoke">Karaoke kotak (ala CapCut)</option>
+    <option value="bold">Tebal, kata aktif kuning</option>
+    <option value="side">Samping, kata kunci besar</option>
+  </select>
+  <div style="height:10px"></div>
   <label>Teks (tulis KATA KUNCI dengan huruf kapital)</label>
   <textarea id="txt" placeholder="kita harus BERUBAH sekarang"></textarea>
   <div class="row" style="margin-top:8px">
@@ -161,8 +172,8 @@ const W = 540, H = 960, CH = 90, ACC = '#ffcf3a';
 const cv = $('#cv'), cx = cv.getContext('2d');
 const vid = $('#vid');
 
-const S = { start:0, end:30, pan:.5, mode:'crop', words:[], groups:[], auto:false, tr:null, keys:new Set(), warm:0, file:null, from:null, ytUrl:null, out:null, ab:null, tw:{}, chosen:false, gm:null };
-let srcMode = 'up', busy = false, lastPct = -1;
+const S = { start:0, end:30, pan:.5, mode:'crop', words:[], groups:[], auto:false, tr:null, keys:new Set(), warm:0, file:null, from:null, ytUrl:null, out:null, capStyle:'karaoke', ab:null, tw:{}, chosen:false, gm:null };
+let srcMode = 'up', busy = false, lastPct = -1, lastT = 0, lastMove = 0;
 let rec = null, actx = null, gain = null, adest = null, srcNode = null;
 
 const fx = () => ({ zoom:$('#fxZoom').checked, frame:$('#fxFrame').checked, warm:$('#fxWarm').checked, bar:$('#fxBar').checked, fade:$('#fxFade').checked });
@@ -225,35 +236,96 @@ function fillTextFromWords(){
 }
 
 /* ---------- render ---------- */
+const FONT_SPECS = ['900 40px PonoBlack', '900 40px PonoBlackIt', '700 40px PonoBold', '500 40px PonoMed'];
+let fontsP = null;
+function loadFonts(){
+  if (!fontsP) fontsP = Promise.all(FONT_SPECS.map(f => document.fonts.load(f, 'AaBb Ii 123'))).catch(() => {});
+  return fontsP;
+}
+loadFonts();
+
+// lapisan bingkai + vignette dibuat sekali, lalu hanya ditempel tiap frame
+const ovl = document.createElement('canvas'); ovl.width = W; ovl.height = H;
+(function(){
+  const o = ovl.getContext('2d');
+  const gr = o.createRadialGradient(W/2, H/2, H*.28, W/2, H/2, H*.62);
+  gr.addColorStop(0, 'rgba(0,0,0,0)'); gr.addColorStop(1, 'rgba(0,0,0,.55)');
+  o.fillStyle = gr; o.fillRect(0, 0, W, H);
+  const i = 16, r = 40;
+  o.fillStyle = '#050608'; o.beginPath(); o.rect(0, 0, W, H);
+  if (o.roundRect) o.roundRect(i, i, W-2*i, H-2*i, r); else o.rect(i, i, W-2*i, H-2*i);
+  o.fill('evenodd');
+})();
+// latar blur murah: gambar kecil lalu diperbesar
+const bgc = document.createElement('canvas'); bgc.width = 54; bgc.height = 96;
+const bgx = bgc.getContext('2d');
+
+function outline(t, x, y, fill, lw){
+  cx.lineWidth = lw; cx.lineJoin = 'round'; cx.miterLimit = 2; cx.strokeStyle = '#000';
+  cx.strokeText(t, x, y);
+  cx.fillStyle = fill; cx.fillText(t, x, y);
+}
+function rrect(x, y, w, h2, r){
+  cx.beginPath();
+  if (cx.roundRect) cx.roundRect(x, y, w, h2, r); else cx.rect(x, y, w, h2);
+  cx.fill();
+}
 function drawText(t){
   const g = S.groups.find(x => t >= x.s && t < x.n);
-  if (!g) return {key:false, age:0};
-  const age = t - g.s, a = ease(age / .15), pop = .88 + .12 * a;
-  const lines = g.ws.map(w => ({ t: w.key ? w.w.toUpperCase() : w.w, key: w.key }));
-  const sizes = lines.map(l => l.key ? 88 : 40);
-  const total = sizes.reduce((s,v) => s + v*1.12, 0);
-  const ax = W - 34;
+  if (!g) return;
+  const age = t - g.s, a = ease(age / .12);
+  const st = S.capStyle;
   cx.save();
-  cx.translate(ax, H*.56);
-  cx.scale(pop, pop);
-  cx.globalAlpha = a;
-  cx.textAlign = 'right';
   cx.textBaseline = 'alphabetic';
-  let y = -total/2;
-  lines.forEach((l,i) => {
-    let sz = sizes[i];
-    const fam = 'system-ui,-apple-system,Segoe UI,Roboto,sans-serif';
-    cx.font = (l.key ? 'italic 900 ' : '300 ') + sz + 'px ' + fam;
-    const mw = cx.measureText(l.t).width, maxw = W - 70;
-    if (mw > maxw) { sz = sz * maxw / mw; cx.font = (l.key ? 'italic 900 ' : '300 ') + sz + 'px ' + fam; }
-    y += sz * 1.0;
-    cx.shadowColor = 'rgba(0,0,0,.65)'; cx.shadowBlur = l.key ? 16 : 8; cx.shadowOffsetY = 4;
-    cx.fillStyle = l.key ? ACC : '#ffffff';
-    cx.fillText(l.t, 0, y);
-    y += sz * .12;
+  cx.globalAlpha = a;
+  if (st === 'side') {
+    const lines = g.ws.map(w => ({ t: w.key ? w.w.toUpperCase() : w.w, key: w.key }));
+    const sizes = lines.map(l => l.key ? 88 : 42);
+    const total = sizes.reduce((s, v) => s + v * 1.14, 0);
+    cx.translate(W - 34, H * .56); const pop = .9 + .1 * a; cx.scale(pop, pop);
+    cx.textAlign = 'right';
+    let y = -total / 2;
+    lines.forEach((l, i) => {
+      let sz = sizes[i];
+      const fam = l.key ? 'PonoBlackIt' : 'PonoMed', wt = l.key ? '900 ' : '500 ';
+      cx.font = wt + sz + 'px ' + fam + ', system-ui, sans-serif';
+      const mw = cx.measureText(l.t).width, maxw = W - 70;
+      if (mw > maxw) { sz = sz * maxw / mw; cx.font = wt + sz + 'px ' + fam + ', system-ui, sans-serif'; }
+      y += sz;
+      outline(l.t, 0, y, l.key ? ACC : '#ffffff', sz * (l.key ? .14 : .13));
+      y += sz * .14;
+    });
+    cx.restore();
+    return;
+  }
+  // karaoke / bold: satu baris di bawah-tengah, kata yang sedang diucapkan disorot
+  const box = st === 'karaoke';
+  const fam = box ? 'PonoBlack' : 'PonoBold', wt = box ? '900 ' : '700 ';
+  const words = g.ws.map(w => ({ t: w.w.toUpperCase(), key: w.key, s: w.s }));
+  const base = box ? 66 : 62;
+  let sz = words.map(w => base * (w.key ? 1.12 : 1));
+  const meas = () => words.map((w, i) => { cx.font = wt + sz[i] + 'px ' + fam + ', system-ui, sans-serif'; return cx.measureText(w.t).width; });
+  let ws = meas(), gap = base * (box ? .46 : .3);
+  let total = ws.reduce((x, v) => x + v, 0) + gap * (words.length - 1);
+  const maxw = W - 70;
+  if (total > maxw) { const k = maxw / total; sz = sz.map(v => v * k); gap *= k; ws = meas(); total = ws.reduce((x, v) => x + v, 0) + gap * (words.length - 1); }
+  let act = 0;
+  words.forEach((w, i) => { if (w.s <= t + .02) act = i; });
+  let x = (W - total) / 2; const y = H * .71 + (1 - a) * 16;
+  cx.textAlign = 'left';
+  words.forEach((w, i) => {
+    cx.font = wt + sz[i] + 'px ' + fam + ', system-ui, sans-serif';
+    const on = i === act;
+    if (box && on) {
+      cx.fillStyle = ACC; rrect(x - 14, y - sz[i] * .84, ws[i] + 28, sz[i] * 1.08, 16);
+      cx.fillStyle = '#111'; cx.fillText(w.t, x, y);
+    } else {
+      const col = (!box && on) || w.key ? ACC : '#ffffff';
+      outline(w.t, x, y, col, sz[i] * .17);
+    }
+    x += ws[i] + gap;
   });
   cx.restore();
-  return { key:g.hasKey, age };
 }
 
 function drawVideo(zoom){
@@ -262,13 +334,13 @@ function drawVideo(zoom){
   cx.save();
   cx.translate(W/2, H/2); cx.scale(zoom, zoom); cx.translate(-W/2, -H/2);
   if (S.mode === 'blur') {
-    const sc = Math.max(W/vw, H/vh), dw = vw*sc, dh = vh*sc;
-    cx.save();
-    try { cx.filter = 'blur(26px) brightness(.55)'; } catch(e){}
-    cx.drawImage(vid, (W-dw)/2 - 30, (H-dh)/2 - 30, dw + 60, dh + 60);
-    cx.restore();
-    const fs = W / vw, fw = W, fh = vh * fs;
-    cx.drawImage(vid, 0, (H-fh)/2, fw, fh);
+    const bs = Math.max(54 / vw, 96 / vh);
+    bgx.drawImage(vid, (54 - vw * bs) / 2, (96 - vh * bs) / 2, vw * bs, vh * bs);
+    cx.imageSmoothingEnabled = true;
+    cx.drawImage(bgc, 0, 0, W, H);
+    cx.fillStyle = 'rgba(0,0,0,.45)'; cx.fillRect(0, 0, W, H);
+    const fs = W / vw, fh = vh * fs;
+    cx.drawImage(vid, 0, (H - fh) / 2, W, fh);
   } else {
     const sc = Math.max(W/vw, H/vh), dw = vw*sc, dh = vh*sc;
     const slack = dw - W;
@@ -287,26 +359,13 @@ function render(){
 
   const zoom = f.zoom ? 1 + .18 * ease(.5 - .5*Math.cos(rel / 3.5 * Math.PI)) : 1;
 
-  cx.save();
-  if (f.frame) {
-    const i = 16, r = 40;
-    cx.beginPath();
-    if (cx.roundRect) cx.roundRect(i, i, W-2*i, H-2*i, r); else cx.rect(i, i, W-2*i, H-2*i);
-    cx.clip();
-  }
   drawVideo(zoom);
 
   const tx = S.groups.find(x => t >= x.s && t < x.n);
   const target = (f.warm && tx && tx.hasKey) ? 1 : 0;
   S.warm += (target - S.warm) * .12;
   if (S.warm > .01) { cx.fillStyle = 'rgba(255,140,40,' + (.16 * S.warm).toFixed(3) + ')'; cx.fillRect(0,0,W,H); }
-
-  if (f.frame) {
-    const gr = cx.createRadialGradient(W/2, H/2, H*.28, W/2, H/2, H*.62);
-    gr.addColorStop(0, 'rgba(0,0,0,0)'); gr.addColorStop(1, 'rgba(0,0,0,.55)');
-    cx.fillStyle = gr; cx.fillRect(0,0,W,H);
-  }
-  cx.restore();
+  if (f.frame) cx.drawImage(ovl, 0, 0);
 
   drawText(t);
 
@@ -328,8 +387,17 @@ function loop(){
     $('#btnPlay').textContent = 'Putar klip';
   }
   if (rec) {
-    const p = Math.round(clamp((vid.currentTime - S.start) / Math.max(.1, S.end - S.start), 0, 1) * 100);
-    if (p !== lastPct) { lastPct = p; setStatus('Merekam klip… ' + p + '% (jangan tutup halaman)'); setBar(p / 100); }
+    const cur = vid.currentTime, dur = Math.max(.1, S.end - S.start), now = performance.now();
+    const p = Math.round(clamp((cur - S.start) / dur, 0, 1) * 100);
+    if (cur > lastT + .02) { lastT = cur; lastMove = now; }
+    const stalled = now - lastMove > 4000;
+    const k = p + (stalled ? 's' : '');
+    if (k !== lastPct) {
+      lastPct = k;
+      setStatus('Merekam klip… ' + p + '% (' + Math.max(0, cur - S.start).toFixed(0) + '/' + dur.toFixed(0) + ' dtk)\n' +
+        (stalled ? 'Video macet. Jangan matikan layar atau pindah aplikasi. Kalau terus macet, pakai video 360p yang lebih kecil.' : 'Jangan matikan layar atau pindah aplikasi.'));
+      setBar(p / 100);
+    }
   }
   render();
   requestAnimationFrame(loop);
@@ -370,6 +438,8 @@ async function startRec(){
   if (!window.MediaRecorder || !cv.captureStream) throw new Error('Browser ini belum mendukung perekaman. Pakai Chrome di Android.');
   ensureAudio();
   if (actx && actx.state === 'suspended') await actx.resume();
+  let wl = null;
+  try { if (navigator.wakeLock) wl = await navigator.wakeLock.request('screen'); } catch(e){}
   vid.pause();
   vid.currentTime = S.start;
   await waitSeek();
@@ -382,10 +452,11 @@ async function startRec(){
   let resolveRec;
   const done = new Promise(r => { resolveRec = r; });
   let mr;
-  try { mr = new MediaRecorder(stream, mime ? { mimeType:mime, videoBitsPerSecond:5000000 } : {}); }
+  try { mr = new MediaRecorder(stream, mime ? { mimeType:mime, videoBitsPerSecond:4000000 } : {}); }
   catch(e){ if (gain) gain.gain.value = 1; throw new Error('Gagal memulai rekaman: ' + e.message); }
   mr.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
   mr.onstop = () => {
+    try { if (wl) wl.release(); } catch(e){}
     if (gain) gain.gain.value = 1;
     const type = mr.mimeType || mime || 'video/webm';
     const blob = new Blob(chunks, { type });
@@ -790,7 +861,8 @@ async function generate(redo){
       if (!S.chosen) await analyze();
     }
     $('#outBox').innerHTML = '';
-    lastPct = -1;
+    lastPct = -1; lastT = 0; lastMove = performance.now();
+    await loadFonts();
     const out = await startRec();
     if (!out) throw new Error('Perekaman gagal dimulai.');
     try { vid.currentTime = S.start; } catch(e){}
@@ -828,6 +900,7 @@ $('#btnSample').onclick = () => {
   $('#txt').value = 'kita harus BERUBAH sekarang kalau mau hasil yang LEBIH BAIK dan jangan tunggu BESOK';
   S.auto = false; refreshWords();
 };
+$('#capStyle').addEventListener('change', e => { S.capStyle = e.target.value; });
 $('#btnPlay').onclick = play;
 $('#btnKeySave').onclick = () => {
   const g = $('#key').value.trim(), m = $('#gkey').value.trim();
